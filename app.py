@@ -1,12 +1,13 @@
-import os, uuid, json, time, threading, subprocess, shutil
+import os, uuid, json, threading, subprocess
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from google.cloud import texttospeech
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150 MB upload limit for this starter
+app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024
 ROOT = Path("/tmp/myanmar_dubber")
 ROOT.mkdir(parents=True, exist_ok=True)
 JOBS = {}
@@ -24,8 +25,8 @@ button{padding:13px;border:0;border-radius:10px;background:#2155d6;color:white;f
 #status{white-space:pre-wrap;background:#f2f4f8;border-radius:10px;padding:12px;margin-top:14px}
 </style></head><body><main>
 <h1>မြန်မာ Video Dubber</h1>
-<p>၅ မိနစ်အောက် MP4 တင်ပါ။ မြန်မာအသံနှင့် မြန်မာစာတန်းထိုးပါတဲ့ MP4 ထုတ်ပေးရန် စမ်းသပ်ဗားရှင်းဖြစ်ပါတယ်။</p>
-<p class="hint">မှတ်ချက် — AI API အသုံးပြုခနှင့် Google Cloud TTS ကုန်ကျစရိတ် ရှိနိုင်ပါတယ်။ ကိုယ်ပိုင် သို့မဟုတ် အသုံးပြုခွင့်ရှိတဲ့ ဗီဒီယိုများကိုသာ တင်ပါ။</p>
+<p>၅ မိနစ်အောက် MP4 တင်ပါ။ Gemini AI ဖြင့် စကားပြောစာသားကို သိရှိပြီး မြန်မာအသံနှင့် မြန်မာစာတန်းထိုးပါတဲ့ MP4 ထုတ်ပေးရန် စမ်းသပ်ဗားရှင်းဖြစ်ပါတယ်။</p>
+<p class="hint">မှတ်ချက် — Gemini API နှင့် Google Cloud TTS အသုံးပြုခ/ကန့်သတ်ချက်များ ရှိနိုင်ပါတယ်။ ကိုယ်ပိုင် သို့မဟုတ် အသုံးပြုခွင့်ရှိတဲ့ ဗီဒီယိုများကိုသာ တင်ပါ။</p>
 <form id="f"><input type="file" id="video" accept="video/mp4,video/*" required><button id="go">ဘာသာပြန်ပြီး MP4 ထုတ်မယ်</button></form>
 <div id="status">အဆင်သင့်ဖြစ်ပါပြီ။</div><div id="download"></div>
 </main><script>
@@ -60,40 +61,84 @@ def run(cmd):
     return p.stdout.strip()
 
 def get_clients():
-    key = os.environ.get("OPENAI_API_KEY")
+    key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        raise RuntimeError("OPENAI_API_KEY ကို Render Environment Variables မှာ ထည့်ပါ။")
+        raise RuntimeError("GEMINI_API_KEY ကို Render Environment Variables မှာ ထည့်ပါ။")
     cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if cred:
         cred_path = Path("/tmp/google-tts-service-account.json")
         cred_path.write_text(cred, encoding="utf-8")
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(cred_path)
     elif not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON ကို Render Environment Variables မှာ ထည့်ပါ။")
-    return OpenAI(api_key=key), texttospeech.TextToSpeechClient()
+        raise RuntimeError("Google Cloud TTS အတွက် GOOGLE_APPLICATION_CREDENTIALS_JSON ကို Render Environment Variables မှာ ထည့်ပါ။")
+    return genai.Client(api_key=key), texttospeech.TextToSpeechClient()
+
+def parse_json_response(text):
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+    return json.loads(raw.strip())
+
+def transcribe_audio(client, audio_path):
+    # Gemini listens to the extracted audio and returns approximate sentence-level timings.
+    uploaded = client.files.upload(file=str(audio_path))
+    prompt = """
+Listen to the entire audio carefully. Transcribe every spoken dialogue in the original language.
+Return ONLY valid JSON in this exact shape:
+{"segments":[{"start":0.0,"end":2.5,"text":"spoken words"}]}
+Rules:
+- start/end are seconds from the beginning of the audio, numbers, not strings.
+- Keep segments in chronological order, one sentence or short utterance per segment.
+- Do not translate; preserve the original words and language.
+- Use realistic approximate start/end times aligned to the speech.
+- Ignore music and sound effects without speech.
+- No markdown, no extra keys, no explanation.
+"""
+    response = client.models.generate_content(
+        model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=[prompt, uploaded],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    data = parse_json_response(response.text)
+    segments = []
+    for item in data.get("segments", []):
+        try:
+            start, end = float(item["start"]), float(item["end"])
+            text = str(item["text"]).strip()
+            if text and end > start >= 0:
+                segments.append({"start": start, "end": end, "text": text})
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not segments:
+        raise RuntimeError("Gemini က စကားပြောစာသား မတွေ့ပါ။ အသံပါဝင်မှုကို စစ်ဆေးပါ။")
+    return segments
 
 def translate_segments(client, segments):
-    # Translate a small group at a time to avoid overly long prompts.
     translated = []
     for start in range(0, len(segments), 25):
         batch = segments[start:start+25]
         numbered = "\n".join(f'{i+1}. {s["text"]}' for i,s in enumerate(batch))
         prompt = (
             "Translate each numbered dialogue line into natural, concise Burmese (Myanmar language). "
-            "Keep names and meaning. Return ONLY a JSON array of strings in the same order; no explanations. "
-            "Do not merge lines. Input:\n" + numbered
+            "Preserve meaning, names, and order. Return ONLY a JSON array of strings with exactly "
+            f"{len(batch)} items. Do not merge lines or add explanations. Input:\n{numbered}"
         )
-        response = client.chat.completions.create(
-            model=os.environ.get("TRANSLATION_MODEL", "gpt-4o-mini"),
-            messages=[{"role":"system","content":"You are a careful English-to-Burmese audiovisual translator."},
-                      {"role":"user","content":prompt}],
-            temperature=0.2
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
         )
-        raw = response.choices[0].message.content.strip()
-        raw = raw.removeprefix("```json").removesuffix("```").strip()
-        arr = json.loads(raw)
+        arr = parse_json_response(response.text)
         if not isinstance(arr, list) or len(arr) != len(batch):
-            raise RuntimeError("ဘာသာပြန် AI က မျှော်လင့်ထားတဲ့ပုံစံနဲ့ မပြန်ပေးပါ။")
+            raise RuntimeError("Gemini ဘာသာပြန်ရလဒ် ပုံစံမမှန်ပါ။ ထပ်စမ်းကြည့်ပါ။")
         translated.extend(str(x).strip() for x in arr)
     return translated
 
@@ -112,20 +157,8 @@ def process_video(job_id, input_path):
         client, tts = get_clients()
         audio_path = folder / "audio.mp3"
         run(["ffmpeg","-y","-i",str(input_path),"-vn","-ac","1","-ar","16000","-b:a","64k",str(audio_path)])
-        with open(audio_path, "rb") as af:
-            tr = client.audio.transcriptions.create(
-                model="whisper-1", file=af, response_format="verbose_json",
-                timestamp_granularities=["segment"]
-            )
-        segments = []
-        for s in getattr(tr, "segments", []) or []:
-            txt = (s.get("text","") if isinstance(s,dict) else getattr(s,"text","")).strip()
-            start = s.get("start",0) if isinstance(s,dict) else getattr(s,"start",0)
-            end = s.get("end",0) if isinstance(s,dict) else getattr(s,"end",0)
-            if txt and end > start:
-                segments.append({"start":float(start),"end":float(end),"text":txt})
-        if not segments:
-            raise RuntimeError("စကားပြောစာသား မတွေ့ပါ။ Video အသံပါဝင်မှုကို စစ်ဆေးပါ။")
+        with LOCK: JOBS[job_id].update(message="Gemini AI က စကားပြောကို စာသားပြောင်းနေပါသည်...")
+        segments = transcribe_audio(client, audio_path)
         with LOCK: JOBS[job_id].update(message=f"စကားပြော {len(segments)} ပိုင်းကို မြန်မာလို ဘာသာပြန်နေပါသည်...")
         translations = translate_segments(client, segments)
         client_cfg = texttospeech.AudioConfig(
@@ -133,7 +166,6 @@ def process_video(job_id, input_path):
             sample_rate_hertz=24000,
             speaking_rate=1.0
         )
-        # Make a timed voice track with silence between speech segments.
         wavs = []
         for idx, (seg, mytxt) in enumerate(zip(segments, translations)):
             if not mytxt:
@@ -144,7 +176,6 @@ def process_video(job_id, input_path):
             wav_path = folder / f"voice_{idx:04d}.wav"
             wav_path.write_bytes(result.audio_content)
             target = max(0.35, seg["end"] - seg["start"])
-            # Adjust each translated phrase to roughly fit its original timing.
             adjusted = folder / f"adj_{idx:04d}.wav"
             probe = run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(wav_path)])
             actual = max(0.1, float(probe))
@@ -157,7 +188,6 @@ def process_video(job_id, input_path):
             with LOCK: JOBS[job_id]["message"] = f"မြန်မာအသံ ထုတ်နေပါသည်... {idx+1}/{len(segments)}"
         if not wavs:
             raise RuntimeError("မြန်မာအသံ မထုတ်နိုင်ပါ။")
-        # Mix all delayed segments into one track.
         inputs = []
         for w in wavs: inputs += ["-i",str(w)]
         labels = "".join(f"[{i}:a]" for i in range(len(wavs)))
@@ -166,12 +196,9 @@ def process_video(job_id, input_path):
         run(["ffmpeg","-y",*inputs,"-filter_complex",mix_filter,"-map","[mix]","-ac","2",str(dub)])
         srt = folder / "burmese.srt"
         with srt.open("w",encoding="utf-8") as f:
-            n=1
-            for seg, txt in zip(segments, translations):
+            for n, (seg, txt) in enumerate(zip(segments, translations), start=1):
                 f.write(f"{n}\n{srt_time(seg['start'])} --> {srt_time(seg['end'])}\n{txt}\n\n")
-                n+=1
         output = folder / "myanmar_dubbed.mp4"
-        # Keep original soundtrack low under the Burmese voice; embed selectable Burmese subtitles.
         run(["ffmpeg","-y","-i",str(input_path),"-i",str(dub),"-i",str(srt),
              "-filter_complex","[0:a]volume=0.18[bg];[1:a]volume=1.0[vo];[bg][vo]amix=inputs=2:duration=first:dropout_transition=2[aout]",
              "-map","0:v:0","-map","[aout]","-map","2:0","-c:v","libx264","-preset","veryfast","-crf","23",
