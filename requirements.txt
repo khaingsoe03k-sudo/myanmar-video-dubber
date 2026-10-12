@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+gunicorn>=22,<24
+openai>=1.40
+google-cloud-texttospeech>=2.16
