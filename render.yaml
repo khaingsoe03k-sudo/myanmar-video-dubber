@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: myanmar-video-dubber
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        sync: false
+      - key: TRANSLATION_MODEL
+        value: gpt-4o-mini
